@@ -1,11 +1,14 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.egg-info/
 dist/
 build/
-*.egg
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .vscode/
@@ -17,6 +20,13 @@ build/
 .DS_Store
 Thumbs.db
 
-# Config local (no subir configs con keys reales)
+# Config local y secretos
 config.json
 config.yml
+.env
+.env.*
+!.env.example
+
+# Backups
+*.bak
+*.backup
