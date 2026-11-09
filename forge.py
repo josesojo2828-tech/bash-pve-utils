@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import json
 import logging
 import os
 import shutil
@@ -26,7 +27,7 @@ logger = logging.getLogger("forge")
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(LOG_FORMAT))
     logger.addHandler(handler)
     logger.setLevel(level)
@@ -278,8 +279,8 @@ def _fetch_server_resources(orch: PVEOrchestrator) -> dict:
     # RAM
     ram_raw = _run_cmd(orch, "free -h | awk 'NR==2{print $2, $3, $4, $7}'")
     if ram_raw:
-        parts = ram_raw.split()
-        info["ram_total"], info["ram_used"], info["ram_free"], info["ram_avail"] = parts[0], parts[1], parts[2], parts[3] if len(parts) >= 4 else "?"
+        parts = (ram_raw.split() + ["?"] * 4)[:4]
+        info["ram_total"], info["ram_used"], info["ram_free"], info["ram_avail"] = parts
 
     # Swap
     swap_raw = _run_cmd(orch, "free -h | awk 'NR==3{print $2, $3, $4}'")
@@ -540,6 +541,62 @@ def display_report(info: dict, containers: list[dict], vms: list[dict], access_h
 # ── Main ─────────────────────────────────────────────────────────────────
 
 
+def _ansible_host(value: str) -> str:
+    """Normalise an IP/hostname for the ansible_host variable."""
+    value = (value or "").strip()
+    return "" if value in ("", "?") else value
+
+
+def _build_inventory(info: dict, containers: list[dict], vms: list[dict]) -> dict:
+    """Build an Ansible dynamic inventory from a PVE inspection."""
+    hostvars: dict[str, dict] = {}
+    groups: dict[str, list[str]] = {"lxc": [], "qemu": [], "running": [], "stopped": []}
+
+    host_name = info.get("hostname") or "pve"
+    hostvars[host_name] = {
+        "pve_role": "host",
+        "pve_version": info.get("version", ""),
+        "pve_uptime": info.get("uptime", ""),
+        "pve_cpu_cores": info.get("cpu_cores", ""),
+        "pve_ram_total": info.get("ram_total", ""),
+        "pve_disk_total": info.get("disk_total", ""),
+    }
+    host_address = _ansible_host(info.get("host_ip", ""))
+    if host_address:
+        hostvars[host_name]["ansible_host"] = host_address
+
+    for kind, items in (("lxc", containers), ("qemu", vms)):
+        for item in items:
+            vmid = str(item.get("vmid", "unknown"))
+            name = item.get("name") or f"{kind}-{vmid}"
+            if name in hostvars:
+                name = f"{name}-{vmid}"
+            groups[kind].append(name)
+
+            status = item.get("status", "")
+            if status in ("running", "stopped"):
+                groups[status].append(name)
+
+            variables = {
+                "pve_role": kind,
+                "pve_vmid": vmid,
+                "pve_status": status,
+                "pve_cores": item.get("cores", "?"),
+                "pve_memory": item.get("memory", "?"),
+            }
+            address = _ansible_host(item.get("ip", ""))
+            if address:
+                variables["ansible_host"] = address
+            hostvars[name] = variables
+
+    inventory: dict[str, Any] = {"_meta": {"hostvars": hostvars}}
+    inventory["all"] = {"children": ["pve_hosts", "lxc", "qemu"]}
+    inventory["pve_hosts"] = {"hosts": [host_name]}
+    for group, hosts in groups.items():
+        inventory[group] = {"hosts": hosts}
+    return inventory
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="bash-pve-utils: PVE Server Inspector"
@@ -549,10 +606,20 @@ def main() -> None:
     parser.add_argument("--user", default="root", help="SSH user name (default: root)")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument("--password", action="store_true", help="Prompt for SSH password")
+    parser.add_argument("--json", action="store_true",
+                        help="Print raw inspection data as JSON (machine readable)")
+    parser.add_argument("--inventory", action="store_true",
+                        help="Print an Ansible dynamic inventory as JSON")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
     setup_logging(args.verbose)
+
+    machine_output = args.json or args.inventory
+
+    def _progress(message: str) -> None:
+        if not machine_output:
+            print(message)
 
     if args.host is None:
         creds = _prompt_credentials()
@@ -569,26 +636,34 @@ def main() -> None:
 
     try:
         orch.establish_connection()
-        print()
-        print(f"  {_fmt_ok('\u25b6')}  Connecting to {host}...")
+        _progress("")
+        _progress(f"  {_fmt_ok('\u25b6')}  Connecting to {host}...")
 
         access_ok, access_hint = _check_pve_access(orch)
 
-        print(f"  {_fmt_dim('\u25b6')}  Fetching server resources...")
+        _progress(f"  {_fmt_dim('\u25b6')}  Fetching server resources...")
         info = _fetch_server_resources(orch)
         info["host_ip"] = host
 
         if access_ok:
-            print(f"  {_fmt_dim('\u25b6')}  Fetching containers...")
+            _progress(f"  {_fmt_dim('\u25b6')}  Fetching containers...")
             containers = _fetch_containers(orch)
-            print(f"  {_fmt_dim('\u25b6')}  Fetching VMs...")
+            _progress(f"  {_fmt_dim('\u25b6')}  Fetching VMs...")
             vms = _fetch_vms(orch)
         else:
             containers = []
             vms = []
 
-        hint = f"Limited data: {access_hint}" if not access_ok else ""
-        display_report(info, containers, vms, access_hint=hint)
+        if args.json:
+            print(json.dumps(
+                {"host": info, "containers": containers, "vms": vms},
+                indent=2, ensure_ascii=False,
+            ))
+        elif args.inventory:
+            print(json.dumps(_build_inventory(info, containers, vms), indent=2, ensure_ascii=False))
+        else:
+            hint = f"Limited data: {access_hint}" if not access_ok else ""
+            display_report(info, containers, vms, access_hint=hint)
 
         orch.close_connection()
 
@@ -597,8 +672,9 @@ def main() -> None:
         orch.close_connection()
         sys.exit(130)
 
-    print(f"  {_fmt_dim('Done.')}")
-    print()
+    if not machine_output:
+        print(f"  {_fmt_dim('Done.')}")
+        print()
 
 
 if __name__ == "__main__":

@@ -14,9 +14,25 @@ Inspector de servidores Proxmox VE vía SSH. Conectá, escaneá recursos, contai
 # Modo interactivo (te pide IP, usuario, puerto, password)
 python3 forge.py
 
-# O直接 con argumentos
+# O directo con argumentos
 python3 forge.py 192.168.1.100 --user root --port 22 --password
 ```
+
+## Salida JSON y Ansible
+
+```bash
+# Datos crudos de la inspección
+python3 forge.py 192.168.1.100 --json
+
+# Inventario dinámico de Ansible
+python3 forge.py 192.168.1.100 --inventory > inventory.json
+ansible-inventory -i inventory.json --graph
+ansible-playbook -i inventory.json site.yml
+```
+
+El inventario genera los grupos `pve_hosts`, `lxc`, `qemu`, `running` y `stopped`, con
+`ansible_host` (cuando hay IP) y las variables `pve_vmid`, `pve_status`, `pve_cores` y
+`pve_memory`. Los logs van a `stderr`, así que el JSON de `stdout` se puede parsear directo.
 
 ## Output
 
